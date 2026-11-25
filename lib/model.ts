@@ -98,6 +98,7 @@ export interface BoardRow {
   symbol: string | null;
   token_status: 'pre-token';
   age_days: number | null;
+  age_bucket: AgeBucket;
   implied_value_usd: number;
   model: {
     category_multiple: number;
@@ -105,6 +106,11 @@ export interface BoardRow {
     growth_multiplier: number;
     maturity_multiplier: number;
     age_days: number | null;
+    implied_low_usd: number;
+    implied_high_usd: number;
+    implied_range_pct: number;
+    multiple_source: MultipleSource;
+    formula: string;
   };
   farm_steps: string[];
 }
@@ -125,6 +131,12 @@ export interface RadarRow {
   category_multiple: number;
   growth_multiplier: number;
   maturity_multiplier: number;
+  implied_low_usd: number;
+  implied_high_usd: number;
+  implied_range_pct: number;
+  multiple_source: MultipleSource;
+  age_bucket: AgeBucket;
+  formula: string;
 }
 
 /** A live-token protocol: it already trades, so the board shows the market's own value, not a model's. */
@@ -152,6 +164,7 @@ export interface RadarData {
   multiples: Record<string, number>;
   multiple_peers: Record<string, number>;
   global_multiple: number;
+  stats: BoardStats;
   rows: RadarRow[];
   live: LiveRow[];
 }
@@ -250,6 +263,156 @@ export function impliedValue(
   return { implied, catMult, growthPct, growthMult, maturityMult, age };
 }
 
+/** How long a protocol has run with no token, in the words the dashboard filters on. */
+export type AgeBucket = 'new' | 'growing' | 'established' | 'unknown';
+
+/** The age bucket one protocol falls in: new under six months, growing under a year,
+ * established past a year, unknown where the snapshot records no listing date. The bucket is
+ * a filter in the dashboard, not a score: a young protocol is not a worse one, only a younger
+ * one, and the board ranks it on the same implied value as every other row. */
+export function ageBucket(age: number | null): AgeBucket {
+  if (age === null) return 'unknown';
+  if (age < 180) return 'new';
+  if (age < 365) return 'growing';
+  return 'established';
+}
+
+/** The multiplication behind one row's implied value, as a readable chain: TVL times the
+ * category multiple times the growth multiplier times the maturity multiplier equals the
+ * implied value. The dashboard shows the chain in the detail view so the number can be
+ * checked by hand instead of taken on trust. */
+export function formulaFor(
+  protocol: SnapshotProtocol,
+  catMult: number,
+  growthMult: number,
+  maturityMult: number,
+  implied: number,
+): string {
+  return `${protocol.tvl_usd.toLocaleString('en-US')} × ${round4(catMult)} × ${round4(growthMult)} × ${round4(maturityMult)} = ${implied.toLocaleString('en-US')}`;
+}
+
+/** The implied-value range one protocol gets when its two uncertain inputs move: the category
+ * multiple by a quarter either way and the seven-day growth by ten points either way. A point
+ * estimate pretends the multiple is exact; the range says how much the answer moves when it is
+ * not. The range is a property of the model, not of the protocol: every row gets the same
+ * treatment, and the dashboard shows the range beside the point estimate. */
+export interface Sensitivity {
+  low_usd: number;
+  high_usd: number;
+}
+
+/** How far the category multiple and the growth may move in the sensitivity range. */
+const SENSITIVITY_MULTIPLE = 0.25;
+const SENSITIVITY_GROWTH = 10;
+
+/** The implied-value range for one protocol under `model`: the low end prices the category
+ * multiple a quarter lower and the growth ten points lower, the high end the reverse, each
+ * clamped to the model's own bounds so the range never leaves the model's world. The caller
+ * turns the two ends into a percentage against the point estimate it already computed. */
+export function sensitivityValue(
+  protocol: SnapshotProtocol,
+  asOf: string,
+  model: ModelConstants,
+  multiples: Record<string, number>,
+  global: number,
+): Sensitivity {
+  const catMult = categoryMultiple(protocol, multiples, global);
+  const age = ageDays(asOf, protocol.listed_at);
+  const ageForModel = age ?? model.unknown_age_days;
+  const maturityMult = model.maturity_floor + (Math.min(Math.max(ageForModel, 0), model.maturity_days) / model.maturity_days) * model.maturity_range;
+  const rawGrowth = finite(protocol.change_7d, 0);
+  const growthPct = Math.min(model.growth_cap, Math.max(model.growth_floor, rawGrowth));
+  const lowGrowth = Math.min(model.growth_cap, Math.max(model.growth_floor, growthPct - SENSITIVITY_GROWTH));
+  const highGrowth = Math.min(model.growth_cap, Math.max(model.growth_floor, growthPct + SENSITIVITY_GROWTH));
+  const lowMult = Math.min(model.multiple_cap, Math.max(model.multiple_floor, catMult * (1 - SENSITIVITY_MULTIPLE)));
+  const highMult = Math.min(model.multiple_cap, Math.max(model.multiple_floor, catMult * (1 + SENSITIVITY_MULTIPLE)));
+  const low = Math.max(1, Math.round(protocol.tvl_usd * lowMult * (1 + (lowGrowth / 100) * model.growth_weight) * maturityMult));
+  const high = Math.max(1, Math.round(protocol.tvl_usd * highMult * (1 + (highGrowth / 100) * model.growth_weight) * maturityMult));
+  return { low_usd: low, high_usd: high };
+}
+
+/** Whether a protocol's category multiple came from its own trading peers or the global fallback. */
+export type MultipleSource = 'peers' | 'global';
+
+/** Where one protocol's multiple came from: peers when its category holds at least `min_peers`
+ * trading protocols, the global median otherwise. The dashboard names the source beside the
+ * number, so a multiple built on twelve peers is not confused with one built on none. */
+export function multipleSource(
+  protocol: SnapshotProtocol,
+  peers: Record<string, number>,
+  model: ModelConstants = MODEL,
+): MultipleSource {
+  return (peers[protocol.category ?? 'Other'] ?? 0) >= model.min_peers ? 'peers' : 'global';
+}
+
+/** One category's share of the board: how many rows it holds and what they are worth together. */
+export interface CategoryStat {
+  category: string;
+  rows: number;
+  watchlist_rows: number;
+  total_implied_usd: number;
+  median_multiple: number;
+}
+
+/** The board in aggregate: what the whole ranking is worth, how concentrated it is, and how the
+ * watchlist spreads across categories. The dashboard's stats panel reads this, not the rows. */
+export interface BoardStats {
+  rows: number;
+  total_implied_usd: number;
+  median_implied_usd: number;
+  top3_share_pct: number;
+  top10_share_pct: number;
+  watchlist_total_implied_usd: number;
+  categories: CategoryStat[];
+}
+
+/** The board's aggregate figures, from the board itself: the total and median implied value, the
+ * share the top three and top ten rows hold, and one row per category with its own totals. The
+ * categories come out strongest first, so the panel reads as a ranking of where the value sits. */
+export function boardStats(
+  board: BoardRow[],
+  multiples: Record<string, number>,
+  global: number,
+  watchlist: string[],
+): BoardStats {
+  const implied = board.map((r) => r.implied_value_usd).sort((a, b) => a - b);
+  const total = implied.reduce((a, b) => a + b, 0);
+  const mid = Math.floor(implied.length / 2);
+  const medianValue = implied.length === 0 ? 0 : implied.length % 2 === 1 ? implied[mid]! : Math.round((implied[mid - 1]! + implied[mid]!) / 2);
+  const shareOf = (n: number): number => {
+    if (total === 0) return 0;
+    const top = board.slice(0, n).reduce((a, r) => a + r.implied_value_usd, 0);
+    return Math.round((top / total) * 1000) / 10;
+  };
+  const watchlistSet = new Set(watchlist);
+  const watchlistTotal = board.filter((r) => watchlistSet.has(r.slug)).reduce((a, r) => a + r.implied_value_usd, 0);
+  const byCategory = new Map<string, BoardRow[]>();
+  for (const r of board) {
+    const key = r.category ?? 'Other';
+    const list = byCategory.get(key) ?? [];
+    list.push(r);
+    byCategory.set(key, list);
+  }
+  const categories: CategoryStat[] = [...byCategory.entries()]
+    .map(([category, rows]) => ({
+      category,
+      rows: rows.length,
+      watchlist_rows: rows.filter((r) => watchlistSet.has(r.slug)).length,
+      total_implied_usd: rows.reduce((a, r) => a + r.implied_value_usd, 0),
+      median_multiple: median(rows.map((r) => r.model.category_multiple), global),
+    }))
+    .sort((a, b) => b.total_implied_usd - a.total_implied_usd || (a.category < b.category ? -1 : a.category > b.category ? 1 : 0));
+  return {
+    rows: board.length,
+    total_implied_usd: total,
+    median_implied_usd: medianValue,
+    top3_share_pct: shareOf(3),
+    top10_share_pct: shareOf(10),
+    watchlist_total_implied_usd: watchlistTotal,
+    categories,
+  };
+}
+
 /** DefiLlama's version-marker rule: a name ending in a release is a pool of another protocol. */
 const VERSIONED = /\s(V\d+(\.\d+)?|v\d+(\.\d+)?|\d+\.\d+)$/;
 
@@ -278,7 +441,7 @@ export interface BoardSummary {
 
 /** The protocols the board ranks, strongest first, with ranks 1..n. */
 export function buildBoard(snapshot: Snapshot, model: ModelConstants = MODEL): BoardRow[] {
-  const { multiples, global } = computeMultiples(snapshot, model);
+  const { multiples, peers, global } = computeMultiples(snapshot, model);
   const index = bySlug(snapshot.protocols);
   const chosen = new Map<string, SnapshotProtocol>();
   // The watchlist is the floor: every slug, even one the snapshot no longer carries (it cannot, but the
@@ -297,7 +460,12 @@ export function buildBoard(snapshot: Snapshot, model: ModelConstants = MODEL): B
 
   const scored = [...chosen.values()].map((p) => {
     const { implied, catMult, growthPct, growthMult, maturityMult, age } = impliedValue(p, snapshot.as_of, model, multiples, global);
-    return { p, implied, catMult, growthPct, growthMult, maturityMult, age };
+    const sens = sensitivityValue(p, snapshot.as_of, model, multiples, global);
+    const rangePct = implied === 0 ? 0 : Math.round(((sens.high_usd - sens.low_usd) / implied) * 1000) / 10;
+    const source = multipleSource(p, peers, model);
+    const bucket = ageBucket(age);
+    const formula = formulaFor(p, catMult, growthMult, maturityMult, implied);
+    return { p, implied, catMult, growthPct, growthMult, maturityMult, age, sens, rangePct, source, bucket, formula };
   });
   scored.sort((a, b) => b.implied - a.implied || (a.p.slug < b.p.slug ? -1 : a.p.slug > b.slug ? 1 : 0));
   return scored.map((s, i) => ({
@@ -314,6 +482,7 @@ export function buildBoard(snapshot: Snapshot, model: ModelConstants = MODEL): B
     symbol: s.p.symbol,
     token_status: 'pre-token',
     age_days: s.age,
+    age_bucket: s.bucket,
     implied_value_usd: s.implied,
     model: {
       category_multiple: round4(s.catMult),
@@ -321,6 +490,11 @@ export function buildBoard(snapshot: Snapshot, model: ModelConstants = MODEL): B
       growth_multiplier: round4(s.growthMult),
       maturity_multiplier: round4(s.maturityMult),
       age_days: s.age,
+      implied_low_usd: s.sens.low_usd,
+      implied_high_usd: s.sens.high_usd,
+      implied_range_pct: s.rangePct,
+      multiple_source: s.source,
+      formula: s.formula,
     },
     farm_steps: farmSteps(s.p, s.age).map(stepText),
   }));
@@ -468,6 +642,12 @@ export function radarRow(row: BoardRow): RadarRow {
     category_multiple: row.model.category_multiple,
     growth_multiplier: row.model.growth_multiplier,
     maturity_multiplier: row.model.maturity_multiplier,
+    implied_low_usd: row.model.implied_low_usd,
+    implied_high_usd: row.model.implied_high_usd,
+    implied_range_pct: row.model.implied_range_pct,
+    multiple_source: row.model.multiple_source,
+    age_bucket: row.age_bucket,
+    formula: row.model.formula,
   };
 }
 
@@ -477,6 +657,7 @@ export function buildRadar(snapshot: Snapshot, model: ModelConstants = MODEL): {
   const live = liveRows(snapshot);
   const { multiples, peers, global } = computeMultiples(snapshot, model);
   const early = board.filter((r) => !snapshot.watchlist.includes(r.slug)).length;
+  const stats = boardStats(board, multiples, global, snapshot.watchlist);
   const radar: RadarData = {
     as_of: snapshot.as_of,
     source: snapshot.source,
@@ -490,6 +671,7 @@ export function buildRadar(snapshot: Snapshot, model: ModelConstants = MODEL): {
     multiples,
     multiple_peers: peers,
     global_multiple: global,
+    stats,
     rows: board.map(radarRow),
     live,
   };
