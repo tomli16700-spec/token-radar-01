@@ -103,6 +103,15 @@ tbody tr[data-selected="true"] { background: color-mix(in srgb, var(--accent) 8%
 .status::before { content: ""; width: 6px; height: 6px; border-radius: 50%; background: var(--accent); }
 
 .model { margin-top: var(--step-4); padding: var(--step-5); display: grid; gap: var(--step-3); }
+.stats { margin-top: var(--step-4); padding: var(--step-5); display: grid; gap: var(--step-3); }
+.stats-grid { display: grid; grid-template-columns: repeat(auto-fit, minmax(180px, 1fr)); gap: var(--step-3); }
+.stats-grid .fact { display: grid; gap: 2px; padding: var(--step-3); border: 1px solid var(--border); border-radius: var(--radius-control); }
+.stats-grid .fact b { font-family: var(--font-num); font-size: 17px; font-weight: 600; }
+.stats-grid .fact span { color: var(--muted); font-size: 12px; }
+.stats h3 { margin-top: var(--step-2); }
+.top-list { margin: 0; padding-left: var(--step-5); display: grid; gap: var(--step-1); }
+.top-list li { padding-left: var(--step-1); }
+.top-list li::marker { font-family: var(--font-num); color: var(--muted); }
 .formula { font-family: var(--font-num); font-size: 13px; line-height: 1.7; color: var(--muted); overflow-wrap: anywhere; }
 .empty { padding: var(--step-7) var(--step-5); text-align: center; display: grid; gap: var(--step-3); justify-items: center; }
 .empty p { color: var(--muted); }
@@ -128,6 +137,7 @@ tbody tr[data-selected="true"] { background: color-mix(in srgb, var(--accent) 8%
 .equation { display: grid; gap: var(--step-2); font-family: var(--font-num); font-size: 13px; }
 .equation div { display: flex; justify-content: space-between; gap: var(--step-3); }
 .equation span { color: var(--muted); }
+.equation .wrap { overflow-wrap: anywhere; white-space: normal; text-align: right; }
 .steps { margin: 0; padding-left: var(--step-5); display: grid; gap: var(--step-3); }
 .steps li { padding-left: var(--step-1); }
 .steps b { display: block; font-weight: 500; }
